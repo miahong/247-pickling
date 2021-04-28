@@ -168,8 +168,12 @@ def process_extracted_logits(args, concat_logits, sentence_token_ids):
     elif prediction_scores.shape[0] == 1:
         true_y = torch.tensor(sentence_token_ids[0][1:]).unsqueeze(-1)
     else:
-        sti = torch.tensor(sentence_token_ids)
-        true_y = torch.cat([sti[0, 1:], sti[1:, -1]]).unsqueeze(-1)
+        try:
+            sti = torch.tensor(sentence_token_ids)
+            true_y = torch.cat([sti[0, 1:], sti[1:, -1]]).unsqueeze(-1)
+        except ValueError:
+            true_y = torch.tensor([tup[-1] for tup in sentence_token_ids
+                                   ][1:]).unsqueeze(-1)
 
     prediction_probabilities = F.softmax(prediction_scores, dim=1)
 
@@ -210,6 +214,11 @@ def extract_select_vectors(batch_idx, array):
     return x
 
 
+def extract_select_vectors_new(batch_idx, array):
+    x = array[-1, :].clone()
+    return x
+
+
 def model_forward_pass(args, data_dl):
     model = args.model
     device = args.device
@@ -236,6 +245,35 @@ def model_forward_pass(args, data_dl):
     return all_embeddings, all_logits
 
 
+def model_forward_pass_new(args, data_dl):
+    model = args.model
+    device = args.device
+
+    with torch.no_grad():
+        model = model.to(device)
+        model.eval()
+
+        all_embeddings = []
+        all_logits = []
+        for batch_idx, batch in enumerate(data_dl):
+            if batch_idx == 0:
+                continue
+            batch = torch.tensor(batch)
+            batch = batch.to(args.device)
+            model_output = model(batch)
+
+            embeddings = model_output.hidden_states[-1].cpu()
+            logits = model_output.logits.cpu()
+
+            embeddings = embeddings[-1, :].clone().reshape(1, -1)
+            logits = logits[-1, :].clone().reshape(1, -1)
+
+            all_embeddings.append(embeddings)
+            all_logits.append(logits)
+
+    return all_embeddings, all_logits
+
+
 def get_conversation_tokens(df, conversation):
     token_list = df[df.conversation_id == conversation]['token_id'].tolist()
     return token_list
@@ -245,17 +283,17 @@ def make_input_from_tokens(args, token_list):
     size = args.context_length
 
     # HG's approach
-    windows = [
-        tuple(token_list[x:x + size])
-        for x in range(len(token_list) - size + 1)
-    ]
+    # windows = [
+    #     tuple(token_list[x:x + size])
+    #     for x in range(len(token_list) - size + 1)
+    # ]
 
     # ZZ's approach
-    # windows = [
-    #     tuple(token_list[max(i - size, 0):i])
-    #     for i in range(1,
-    #                    len(token_list) + 1)
-    # ]
+    windows = [
+        tuple(token_list[max(i - size, 0):i])
+        for i in range(1,
+                       len(token_list) + 1)
+    ]
     return windows
 
 
@@ -277,8 +315,9 @@ def generate_embeddings_with_context(args, df):
     for conversation in df.conversation_id.unique():
         token_list = get_conversation_tokens(df, conversation)
         model_input = make_input_from_tokens(args, token_list)
-        input_dl = make_dataloader_from_input(model_input)
-        embeddings, logits = model_forward_pass(args, input_dl)
+        # input_dl = make_dataloader_from_input(model_input)
+        # embeddings, logits = model_forward_pass(args, input_dl)
+        embeddings, logits = model_forward_pass_new(args, model_input)
 
         embeddings = process_extracted_embeddings(embeddings)
         assert embeddings.shape[0] == len(token_list)
@@ -381,10 +420,11 @@ def setup_environ(args):
         os.makedirs(args.output_dir, exist_ok=True)
 
         output_file_name = args.conversation_list[args.conversation_id - 1]
-        args.output_file = os.path.join(args.output_dir, output_file_name)
+        args.output_file = os.path.join(args.output_dir,
+                                        output_file_name + '_zz')
 
         args.output_file_prefinal = os.path.join(
-            args.output_dir, output_file_name + '_prefinal')
+            args.output_dir, output_file_name + '_zz_prefinal')
 
     return
 
@@ -450,6 +490,12 @@ def parse_arguments():
     parser.add_argument('--pkl-identifier', type=str, default=None)
     parser.add_argument('--project-id', type=str, default=None)
 
+    # custom_args = [
+    #     '--project-id', 'podcast', '--pkl-identifier', 'full',
+    #     '--conversation-id', '1', '--subject', '661', '--history',
+    #     '--context-length', '1024', '--embedding-type', 'gpt2-xl'
+    # ]
+
     return parser.parse_args()
 
 
@@ -464,7 +510,8 @@ def tokenize_podcast_transcript(args):
         DataFrame: containing tokenized transcript
     """
     DATA_DIR = os.path.join(os.getcwd(), 'data', args.project_id)
-    story_file = os.path.join(DATA_DIR, 'podcast-transcription.txt')
+    # story_file = os.path.join(DATA_DIR, 'podcast-transcription.txt')
+    story_file = os.path.join(DATA_DIR, 'pieman_transcript.txt')
 
     # Read all words and tokenize them
     with open(story_file, 'r') as fp:
@@ -494,7 +541,8 @@ def align_podcast_tokens(args, df):
         df (DataFrame): aligned/filtered dataframe (goes into encoding)
     """
     DATA_DIR = os.path.join(os.getcwd(), 'data', args.project_id)
-    cloze_file = os.path.join(DATA_DIR, 'podcast-datum-cloze.csv')
+    # cloze_file = os.path.join(DATA_DIR, 'podcast-datum-cloze.csv')
+    cloze_file = os.path.join(DATA_DIR, 'piemanAligned_all.txt')
 
     cloze_df = pd.read_csv(cloze_file, sep=',')
     words = list(map(str.lower, cloze_df.word.tolist()))
@@ -539,6 +587,7 @@ def main():
             df = generate_embeddings(args, utterance_df)
 
     if args.project_id == 'podcast':
+        save_pickle(df.to_dict('records'), args.output_file_prefinal)
         df = align_podcast_tokens(args, df)
         df = create_folds(df, 10)
 
