@@ -265,8 +265,8 @@ def model_forward_pass_new(args, data_dl):
             embeddings = model_output.hidden_states[-1].cpu()
             logits = model_output.logits.cpu()
 
-            embeddings = embeddings[-1, :].clone().reshape(1, -1)
-            logits = logits[-1, :].clone().reshape(1, -1)
+            embeddings = embeddings[-2, :].clone().reshape(1, -1)
+            logits = logits[-2, :].clone().reshape(1, -1)
 
             all_embeddings.append(embeddings)
             all_logits.append(logits)
@@ -421,10 +421,7 @@ def setup_environ(args):
 
         output_file_name = args.conversation_list[args.conversation_id - 1]
         args.output_file = os.path.join(args.output_dir,
-                                        output_file_name + '_zz')
-
-        args.output_file_prefinal = os.path.join(
-            args.output_dir, output_file_name + '_zz_prefinal')
+                                        output_file_name)
 
     return
 
@@ -510,8 +507,7 @@ def tokenize_podcast_transcript(args):
         DataFrame: containing tokenized transcript
     """
     DATA_DIR = os.path.join(os.getcwd(), 'data', args.project_id)
-    # story_file = os.path.join(DATA_DIR, 'podcast-transcription.txt')
-    story_file = os.path.join(DATA_DIR, 'pieman_transcript.txt')
+    story_file = os.path.join(DATA_DIR, 'podcast-transcription.txt')
 
     # Read all words and tokenize them
     with open(story_file, 'r') as fp:
@@ -541,8 +537,7 @@ def align_podcast_tokens(args, df):
         df (DataFrame): aligned/filtered dataframe (goes into encoding)
     """
     DATA_DIR = os.path.join(os.getcwd(), 'data', args.project_id)
-    # cloze_file = os.path.join(DATA_DIR, 'podcast-datum-cloze.csv')
-    cloze_file = os.path.join(DATA_DIR, 'piemanAligned_all.txt')
+    cloze_file = os.path.join(DATA_DIR, 'podcast-datum-cloze.csv')
 
     cloze_df = pd.read_csv(cloze_file, sep=',')
     words = list(map(str.lower, cloze_df.word.tolist()))
@@ -587,7 +582,6 @@ def main():
             df = generate_embeddings(args, utterance_df)
 
     if args.project_id == 'podcast':
-        save_pickle(df.to_dict('records'), args.output_file_prefinal)
         df = align_podcast_tokens(args, df)
         df = create_folds(df, 10)
 
