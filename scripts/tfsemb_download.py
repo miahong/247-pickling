@@ -4,8 +4,10 @@ from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokeni
 
 CAUSAL_MODELS = [
     # "gpt2",
+    # "gpt2-medium",
     # "gpt2-large",
     # "gpt2-xl",
+    # "distilgpt2",
     # "EleutherAI/gpt-neo-125M",
     # "EleutherAI/gpt-neo-1.3B",
     # "EleutherAI/gpt-neo-2.7B",
@@ -16,6 +18,11 @@ CAUSAL_MODELS = [
     # "facebook/opt-2.7b",
     # "facebook/opt-6.7b",
     # "facebook/opt-30b",
+    # 'bloom_model_1.3/bloom',
+    # 'bigscience/bloom-350m',
+    # 'bigscience/bloom-1b3',
+    # 'bigscience/bloom-6b3',
+    # 'bigscience/bloom-2b5',
 ]
 SEQ2SEQ_MODELS = ["facebook/blenderbot_small-90M"]
 
@@ -46,7 +53,8 @@ def download_tokenizer_and_model(
         output_hidden_states=True,
         cache_dir=CACHE_DIR,
         local_files_only=local_files_only,
-    )
+        
+    ).half()
 
     print("Downloading tokenizer")
     tokenizer = tokenizer_class.from_pretrained(
@@ -101,7 +109,7 @@ def clone_model_repo(
         except:
             # FIXME: Raise appropriate exception
             print("Possible git lfs version issues")
-    exit(1)
+    
 
 
 def set_cache_dir():

@@ -76,7 +76,9 @@ def main():
         num_convs = 1
 
     stra = args.embedding_type
-    if any([item in args.embedding_type for item in ['gpt2', 'bert','neo','opt']]):
+    if '/' in stra:
+        stra = args.embedding_type.split("/")[-1]
+    if any([item in args.embedding_type for item in ['gpt2', 'bert','neo','opt','bloom']]):
         stra = f'{stra}_cnxt_{args.context_length}'
     args.output_dir = os.path.join(os.getcwd(), 'results', args.project_id,
                                    args.subject, 'embeddings', stra,
@@ -86,8 +88,9 @@ def main():
                                   args.subject, 'pickles',
                                   f'{args.subject}_trimmed_labels.pkl')
     
-
+    # breakpoint()
     layer_folders = sorted(os.listdir(args.output_dir))
+    
     for layer_folder in layer_folders:
         print(f'Merging {layer_folder}')
         conversation_pickles = sorted(glob.glob(os.path.join(args.output_dir, layer_folder, '*')))

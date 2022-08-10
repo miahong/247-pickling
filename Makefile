@@ -98,11 +98,11 @@ download-247-pickles:
 # {54 for 625 | 78 for 676 | 1 for 661}
 %-embeddings: PKL_IDENTIFIER := full
 # {full | trimmed | binned}
-%-embeddings: EMB_TYPE := gpt-neo-125M
-# {'gpt2', 'gpt2-xl', 'gpt2-large', 'EleutherAI/gpt-neo-2.7B', \
+%-embeddings: EMB_TYPE := EleutherAI/gpt-neox-20b
+# {'gpt2','gpt2-medium', 'gpt2-xl', 'gpt2-large','distilgpt2', 'EleutherAI/gpt-neo-2.7B', \
 'EleutherAI/gpt-neo-1.3B','EleutherAI/gpt-neox-20b', "facebook/opt-125m", "facebook/opt-350m", \
 "facebook/opt-1.3b", "facebook/opt-2.7b", "facebook/opt-6.7b", \
-"facebook/opt-30b", "facebook/blenderbot_small-90M"}
+"facebook/opt-30b", "facebook/blenderbot_small-90M","bigscience/bloom-350m"}
 %-embeddings: CNXT_LEN := 1024
 %-embeddings: HIST := --history
 %-embeddings: LAYER := all

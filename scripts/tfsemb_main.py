@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import torch.utils.data as data
 import tfsemb_download as tfsemb_dwnld
 from utils import main_timer
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
 
 
 def save_pickle(args, item, file_name, embeddings=None):
@@ -699,6 +700,11 @@ def select_tokenizer_and_model(args):
         args.model, args.tokenizer = tfsemb_dwnld.download_tokenizers_and_models(
             model_name, local_files_only=True, debug=False
         )[model_name]
+
+        # model_path = '/scratch/gpfs/DATASETS/bloom_model_1.3/bloom'
+        # args.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        # args.model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", offload_folder='offload', torch_dtype=torch.bfloat16)
+
     except OSError:
         # NOTE: Please refer to make-target: cache-models for more information.
         print("Model and tokenizer not found. Please download into cache first.")
