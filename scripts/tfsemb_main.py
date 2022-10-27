@@ -2,7 +2,7 @@ import argparse
 import os
 import pickle
 import string
-
+from pprint import pprint
 import gensim.downloader as api
 import numpy as np
 import pandas as pd
@@ -12,8 +12,11 @@ import torch.nn.functional as F
 import torch.utils.data as data
 import tfsemb_download as tfsemb_dwnld
 from utils import main_timer
-from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
-
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer, GPT2TokenizerFast, GPTNeoXTokenizerFast
+from accelerate import init_empty_weights, infer_auto_device_map, load_checkpoint_and_dispatch
+from tqdm import tqdm
+from lcs import lcs
+from datasets import load_dataset
 
 def save_pickle(args, item, file_name, embeddings=None):
     """Write 'item' to 'file_name.pkl'"""
@@ -163,6 +166,8 @@ def get_unique_sentences(df):
 def process_extracted_embeddings(args, concat_output):
     """(batch_size, max_len, embedding_size)"""
     # concatenate all batches
+    
+    concat_output = [output.to(torch.float32) for output in concat_output]
     concatenated_embeddings = torch.cat(concat_output, dim=0).numpy()
     extracted_embeddings = concatenated_embeddings
 
@@ -208,29 +213,56 @@ def process_extracted_logits(args, concat_logits, sentence_token_ids):
             true_y = torch.cat([sti[0, 1:], sti[1:, -1]]).unsqueeze(-1)
 
     prediction_probabilities = F.softmax(prediction_scores, dim=1)
-
+    prediction_probabilities = prediction_probabilities.to(torch.float32)
     logp = np.log2(prediction_probabilities)
     entropy = [None] + torch.sum(-prediction_probabilities * logp, dim=1).tolist()
-
+    
     top1_probabilities, top1_probabilities_idx = prediction_probabilities.max(dim=1)
     predicted_tokens = args.tokenizer.convert_ids_to_tokens(top1_probabilities_idx)
     predicted_words = predicted_tokens
+
+    # Added for top5 prediction
+    top5_probabilities, top5_probabilities_idx = torch.topk(prediction_probabilities,5)
+    top5_predicted_tokens_flatten = args.tokenizer.convert_ids_to_tokens(torch.flatten(top5_probabilities_idx))
+    top5_predicted_tokens = [top5_predicted_tokens_flatten[x:x+5] for x in range(0, len(top5_predicted_tokens_flatten), 5)]
+
+
     if args.embedding_type in tfsemb_dwnld.CAUSAL_MODELS:
+        
         predicted_words = [
             args.tokenizer.convert_tokens_to_string(token) for token in predicted_tokens
         ]
 
+        top5_predicted_words = []
+        for top5_list in top5_predicted_tokens:
+            top5_predicted = []
+            for token in top5_list:
+                top5_predicted.append(args.tokenizer.convert_tokens_to_string(token))
+            top5_predicted_words.append(top5_predicted)
+        
+        # # code for using gpt2 tokenizer on neox-20b model
+        # predicted_words = []
+        # for token in predicted_tokens:
+        #     if token:
+        #         # print(token)
+        #         # print(args.tokenizer.convert_tokens_to_string(token))
+        #         predicted_words.append(args.tokenizer.convert_tokens_to_string(token))
+                
+        #     else:
+        #         predicted_words.append(token)
+
     # top-1 probabilities
     top1_probabilities = [None] + top1_probabilities.tolist()
+    top5_probabilities = [[None]*5]+ top5_probabilities.tolist()
     # top-1 word
     top1_words = [None] + predicted_words
+    top5_words = [[None]*5] + top5_predicted_words
     # probability of correct word
     true_y_probability = [None] + prediction_probabilities.gather(1, true_y).squeeze(
         -1
     ).tolist()
-    # TODO: probabilities of all words
-
-    return top1_words, top1_probabilities, true_y_probability, entropy
+   
+    return top1_words, top1_probabilities, top5_words, top5_probabilities, true_y_probability, entropy
 
 
 def extract_select_vectors(batch_idx, array):
@@ -268,23 +300,25 @@ def model_forward_pass(args, data_dl):
     model = args.model
     device = args.device
 
+    print(f'In model_forward_pass, print torch cuda device count: ',torch.cuda.device_count())
+
     with torch.no_grad():
-        model = model.to(device)
+        # model = model.to(device)
         model.eval()
 
         all_embeddings = []
         all_logits = []
         for batch_idx, batch in enumerate(data_dl):
-            batch = batch.to(args.device)
+            print('batch_idx: {}'.format(batch_idx))
+        
             model_output = model(batch)
-
             logits = model_output.logits.cpu()
-
+          
             embeddings = extract_select_vectors_all_layers(
                 batch_idx, model_output.hidden_states, args.layer_idx
             )
             logits = extract_select_vectors(batch_idx, logits)
-
+            
             all_embeddings.append(embeddings)
             all_logits.append(logits)
 
@@ -308,7 +342,7 @@ def transformer_forward_pass(args, data_dl):
     accuracy, count = 0, 0
 
     with torch.no_grad():
-        model = model.to(device)
+        # model = model.to(device)
         model.eval()
 
         all_embeddings = []
@@ -480,6 +514,9 @@ def generate_conversational_embeddings(args, df):
     final_top1_word = []
     final_top1_prob = []
     final_true_y_prob = []
+    final_top5_word = []
+    final_top5_prob = []
+
     for conversation in df.conversation_id.unique():
         df_convo = df[df.conversation_id == conversation]
 
@@ -493,7 +530,7 @@ def generate_conversational_embeddings(args, df):
         final_embeddings.append(embeddings)
 
         y_true = np.concatenate([e["decoder_ids"][1:] for e in input_dl[:-1]])
-        top1_word, top1_prob, true_y_prob, entropy = process_extracted_logits(
+        top1_word, top1_prob, top5_word, top5_prob, true_y_prob, entropy = process_extracted_logits(
             args, logits, y_true
         )
 
@@ -501,9 +538,14 @@ def generate_conversational_embeddings(args, df):
         final_top1_word.extend(top1_word[1:])
         final_top1_prob.extend(top1_prob[1:])
         final_true_y_prob.extend(true_y_prob[1:])
+        final_top5_word.extend(top5_word[1:])
+        final_top5_prob.extend(top5_prob[1:])
 
     df["top1_pred"] = final_top1_word
     df["top1_pred_prob"] = final_top1_prob
+    df["top5_pred"] = final_top5_word
+    df["top5_pred_prob"] = final_top5_prob
+    
     df["true_pred_prob"] = final_true_y_prob
     df["surprise"] = -df["true_pred_prob"] * np.log2(df["true_pred_prob"])
     print("Accuracy", (df.token == df.top1_pred).mean())
@@ -538,29 +580,36 @@ def make_dataloader_from_input(windows):
 
 
 def generate_causal_embeddings(args, df):
+    print("Running in generate_causal_embeddings function.")
     df = tokenize_and_explode(args, df)
     if args.embedding_type in tfsemb_dwnld.CAUSAL_MODELS:
         args.tokenizer.pad_token = args.tokenizer.eos_token
     final_embeddings = []
     final_top1_word = []
     final_top1_prob = []
+    final_top5_word = []
+    final_top5_prob = []
     final_true_y_prob = []
     for conversation in df.conversation_id.unique():
         token_list = get_conversation_tokens(df, conversation)
         model_input = make_input_from_tokens(args, token_list)
         input_dl = make_dataloader_from_input(model_input)
         embeddings, logits = model_forward_pass(args, input_dl)
-
+        print("DONE model_forward_pass")
         embeddings = process_extracted_embeddings_all_layers(args, embeddings)
         for _, item in embeddings.items():
             assert item.shape[0] == len(token_list)
         final_embeddings.append(embeddings)
-
-        top1_word, top1_prob, true_y_prob, entropy = process_extracted_logits(
+        print("DONE process_extracted_embeddings_all_layer")
+        top1_word, top1_prob, top5_word, top5_prob, true_y_prob, entropy = process_extracted_logits(
             args, logits, model_input
         )
+
+        print("DONE process_extracted_logits")
         final_top1_word.extend(top1_word)
         final_top1_prob.extend(top1_prob)
+        final_top5_word.extend(top5_word)
+        final_top5_prob.extend(top5_prob)
         final_true_y_prob.extend(true_y_prob)
 
     if len(final_embeddings) > 1:
@@ -572,6 +621,8 @@ def generate_causal_embeddings(args, df):
 
     df["top1_pred"] = final_top1_word
     df["top1_pred_prob"] = final_top1_prob
+    df["top5_pred"] = final_top5_word
+    df["top5_pred_prob"] = final_top5_prob
     df["true_pred_prob"] = final_true_y_prob
     df["surprise"] = -df["true_pred_prob"] * np.log2(df["true_pred_prob"])
     df["entropy"] = entropy
@@ -579,20 +630,69 @@ def generate_causal_embeddings(args, df):
     return df, final_embeddings
 
 
+# def generate_perplexity():
+#     print('RUNNING in perplexity function')
+#     args = parse_arguments()
+#     select_tokenizer_and_model(args)
+#     model_name = args.embedding_type
+    
+#     f = open("/scratch/gpfs/mh6546/gpt-neox/podcast-transcription.txt", "r")
+#     text = f.read()
+#     encodings = args.tokenizer(text, return_tensors="pt")
+
+#     # max_length = args.model.config.max_position_embeddings
+#     max_length = args.context_length
+#     print("PRINT model name: {}".format(model_name))
+#     print("PRINT max_length: {}".format(max_length))
+#     stride = 128
+#     print('PRINT stride: {}'.format(stride))
+#     seq_len = encodings.input_ids.size(1)
+
+#     nlls = []
+#     prev_end_loc = 0
+#     for begin_loc in tqdm(range(0, seq_len, stride)):
+#         end_loc = min(begin_loc + max_length, seq_len)
+#         trg_len = end_loc - prev_end_loc  # may be different from stride on last loop
+#         input_ids = encodings.input_ids[:, begin_loc:end_loc]
+#         target_ids = input_ids.clone()
+#         target_ids[:, :-trg_len] = -100
+
+#         with torch.no_grad():
+#             outputs = args.model(input_ids, labels=target_ids)
+#             neg_log_likelihood = outputs.loss * trg_len
+
+#         nlls.append(neg_log_likelihood)
+
+#         prev_end_loc = end_loc
+#         if end_loc == seq_len:
+#             break
+
+#     ppl = torch.exp(torch.stack(nlls).sum() / end_loc)
+#     print("perplexity: {}".format(ppl))
+#     # breakpoint()
+    
+
+
 def generate_embeddings(args, df):
     tokenizer = args.tokenizer
     model = args.model
     device = args.device
 
-    model = model.to(device)
+    # model = model.to(device)
     model.eval()
     df = tokenize_and_explode(args, df)
-    unique_sentence_list = get_unique_sentences(df)
 
+    
+    unique_sentence_list = get_unique_sentences(df)
+    
+    
     if args.embedding_type in tfsemb_dwnld.CAUSAL_MODELS:
         tokenizer.pad_token = tokenizer.eos_token
 
+    unique_sentence_list = [sent1, sent2, sent3]
+    
     tokens = tokenizer(unique_sentence_list, padding=True, return_tensors="pt")
+
     input_ids_val = tokens["input_ids"]
     attention_masks_val = tokens["attention_mask"]
     dataset = data.TensorDataset(input_ids_val, attention_masks_val)
@@ -606,6 +706,9 @@ def generate_embeddings(args, df):
                 "input_ids": batch[0],
                 "attention_mask": batch[1],
             }
+
+            print(f"number of tokens: {len(batch[0][0])}")
+
             model_output = model(**inputs)
             concat_output.append(model_output[-1][-1].detach().cpu().numpy())
     embeddings = np.concatenate(concat_output, axis=0)
@@ -635,6 +738,7 @@ def setup_environ(args):
     PKL_DIR = os.path.join(RESULTS_DIR, args.subject, "pickles")
 
     args.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     labels_file = "_".join([args.subject, args.pkl_identifier, "labels.pkl"])
     args.pickle_name = os.path.join(PKL_DIR, labels_file)
@@ -642,10 +746,7 @@ def setup_environ(args):
     args.input_dir = os.path.join(DATA_DIR, args.subject)
     args.conversation_list = sorted(os.listdir(args.input_dir))
 
-    args.gpus = torch.cuda.device_count()
-    if args.gpus > 1:
-        args.model = nn.DataParallel(args.model)
-
+ 
     stra = f'{args.embedding_type.split("/")[-1]}_cnxt_{args.context_length}'
 
     # TODO: if multiple conversations are specified in input
@@ -697,13 +798,31 @@ def select_tokenizer_and_model(args):
         return
 
     try:
-        args.model, args.tokenizer = tfsemb_dwnld.download_tokenizers_and_models(
-            model_name, local_files_only=True, debug=False
-        )[model_name]
+        if model_name == 'bloom':
 
-        # model_path = '/scratch/gpfs/DATASETS/bloom_model_1.3/bloom'
-        # args.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        # args.model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", offload_folder='offload', torch_dtype=torch.bfloat16)
+            max_gpu_mem = int(60e9)
+            max_cpu_mem = int(550e9)
+            max_memory = {
+                0: max_gpu_mem,
+                1: max_gpu_mem,
+                2: max_gpu_mem,
+                3: max_gpu_mem,
+                "cpu": max_cpu_mem
+            }
+            model_path = '/scratch/gpfs/DATASETS/bloom_model_1.3/bloom'
+            args.tokenizer = AutoTokenizer.from_pretrained(model_path, add_prefix_space=True, local_files_only=True)
+            args.model = AutoModelForCausalLM.from_pretrained(model_path, output_hidden_states=True, local_files_only=True, 
+                        device_map="auto", offload_folder='offload', torch_dtype=torch.bfloat16, max_memory=max_memory)
+        
+        else:
+            args.model, args.tokenizer = tfsemb_dwnld.download_tokenizers_and_models(
+                model_name, local_files_only=True, debug=False
+            )[model_name]
+
+        # print("PRINT cuda device count: {}".format(torch.cuda.device_count()))
+        
+        # print("Device Map in main:")
+        # pprint(args.model.hf_device_map)
 
     except OSError:
         # NOTE: Please refer to make-target: cache-models for more information.
@@ -750,16 +869,268 @@ def parse_arguments():
 
     return args
 
+def load_model_state_dict():
+    print('RUNNING in load_model_state_dict function')
+    args = parse_arguments()
+    select_tokenizer_and_model(args)
+    model_name = args.embedding_type
+
+    input_ids = torch.tensor([[0, 1, 2, 3, 4, 5]])
+    output = args.model(input_ids)[0]
+
+    vocab_size = args.model.config.vocab_size
+
+    expected_shape = torch.Size((1, 6, vocab_size))
+    print(output.shape==expected_shape)
+
+    expected_slice = torch.tensor(
+        [[[33.8045, 2.3958, 34.2816], [63.7805, 4.8332, 63.5882], [66.9116, 5.2198, 63.1185]]]
+        )
+    print("outputs from Huggingface API")
+    print('model output: \n{}'.format(output[:, :3, :3]))
+    print()
+    print('\nexpected slice:\n{}'.format(expected_slice))
+    print()
+    print(torch.allclose(output[:, :3, :3], expected_slice, atol=1e-4))
+    # print(args.model.state_dict())
+
+
+def generate_entropy():
+    args = parse_arguments()
+    select_tokenizer_and_model(args)
+    # setup_environ(args)
+    model_name = args.embedding_type
+    # device = args.device
+
+    f = open("/scratch/gpfs/mh6546/gpt-neox/podcast-transcription.txt", "r")
+    # f = open("/scratch/gpfs/mh6546/247-pickling/wikitext2.txt","r")
+    text = f.read()
+    print('PRINT text first 10 char: {}'.format(text[:10]))
+    neo_encodings = args.tokenizer(text, return_tensors="pt")
+    neo_token_ids = list(neo_encodings.input_ids)[0].tolist()
+    neo_max_length = args.model.config.max_position_embeddings
+    context_length = args.context_length
+
+    print("PRINT neo model name: {}".format(model_name))
+    print("PRINT neo_max_length: {}".format(neo_max_length))
+    print("PRINT context_length: {}".format(context_length))
+    stride = 512
+    print('PRINT stride: {}'.format(stride))
+    neo_seq_len = len(neo_token_ids)
+
+    # CACHE_DIR = '/scratch/gpfs/mh6546/.cache/'
+    # local_files_only = True
+    # max_gpu_mem = int(60e9)
+    # max_cpu_mem = int(550e9)
+    # max_memory = {
+    #     0: max_gpu_mem,
+    #     1: max_gpu_mem,
+    #     2: max_gpu_mem,
+    #     3: max_gpu_mem,
+    #     "cpu": max_cpu_mem
+    # }
+    # neox20b_model = AutoModelForCausalLM.from_pretrained(
+    #     "/scratch/gpfs/mh6546/.cache/EleutherAI/gpt-neox-20b",
+    #     output_hidden_states=True,
+    #     cache_dir=CACHE_DIR,
+    #     local_files_only=local_files_only,
+    #     device_map="auto", 
+    #     offload_folder="offload", 
+    #     torch_dtype=torch.bfloat16,
+    #     max_memory=max_memory,     
+        
+    # )
+    # neox20b_tokenizer = GPTNeoXTokenizerFast.from_pretrained(
+    #     # tokenizer = tokenizer_class.from_pretrained(
+    #     # tokenizer = GPT2TokenizerFast.from_pretrained(
+    #         "/scratch/gpfs/mh6546/.cache/EleutherAI/gpt-neox-20b",add_prefix_space=True,
+    #         cache_dir=CACHE_DIR,
+    #         local_files_only=local_files_only
+    #     )
+    # neox20b_encodings = neox20b_tokenizer(text,return_tensors="pt")
+
+    # TODO here
+    def entropy_calculation(model, token_id, seq_len):
+        nlls = []
+        prev_end_loc = 0
+        for begin_loc in tqdm(range(0, seq_len, stride)):
+            print()
+            print('begin_loc: {}'.format(begin_loc))
+            end_loc = min(begin_loc + context_length, seq_len)
+            print('end_loc: {}'.format(end_loc))
+            trg_len = end_loc - prev_end_loc  # may be different from stride on last loop
+            print('trg_len: {}'.format(trg_len))
+            input_ids = token_id[begin_loc:end_loc]
+            target_ids = input_ids.copy()
+            target_ids[:-trg_len] = [-100]* len(target_ids[:-trg_len])   
+            input_ids = torch.tensor(input_ids).cuda()
+            target_ids = torch.tensor(target_ids).cuda()
+
+            with torch.no_grad():
+                input_ids = input_ids.view(1, -1)
+                target_ids = target_ids.view(1, -1)
+                outputs = model(input_ids, labels=target_ids)
+                # print(type(outputs))
+                # print(outputs.logits.shape)
+                # exit()
+                neg_log_likelihood = outputs.loss * trg_len
+
+            nlls.append(neg_log_likelihood)
+
+            prev_end_loc = end_loc
+            if end_loc == seq_len:
+                break
+        
+        print(len(nlls))
+        exit()
+        # ppl = torch.exp(torch.stack(nlls).sum() / end_loc) 
+        # return ppl
+    # args.model = args.model.to(device)
+    entropy_calculation(args.model,neo_token_ids, neo_seq_len)
+
+
+
+def generate_perplexity():
+    print('RUNNING in perplexity function')
+    args = parse_arguments()
+    select_tokenizer_and_model(args)
+    setup_environ(args)
+    model_name = args.embedding_type
+    device = args.device
+    f = open("/scratch/gpfs/mh6546/gpt-neox/podcast-transcription.txt", "r")
+    # f = open("/scratch/gpfs/mh6546/247-pickling/wikitext2.txt","r")
+    text = f.read()
+    n = int(len(text)/5)
+    text = text[:n]
+    print('PRINT text first 10 char: {}'.format(text[:10]))
+    neo_encodings = args.tokenizer(text, return_tensors="pt")
+    
+    CACHE_DIR = '/scratch/gpfs/mh6546/.cache/'
+    local_files_only = True
+    max_gpu_mem = int(60e9)
+    max_cpu_mem = int(550e9)
+    max_memory = {
+        0: max_gpu_mem,
+        1: max_gpu_mem,
+        "cpu": max_cpu_mem
+    }
+    neox20b_model = AutoModelForCausalLM.from_pretrained(
+        "/scratch/gpfs/mh6546/.cache/EleutherAI/gpt-neox-20b",
+        output_hidden_states=True,
+        cache_dir=CACHE_DIR,
+        local_files_only=local_files_only,
+        device_map="auto", 
+        offload_folder="offload", 
+        torch_dtype=torch.bfloat16,
+        max_memory=max_memory,     
+        
+    )
+    neox20b_tokenizer = GPTNeoXTokenizerFast.from_pretrained(
+        # tokenizer = tokenizer_class.from_pretrained(
+        # tokenizer = GPT2TokenizerFast.from_pretrained(
+            "/scratch/gpfs/mh6546/.cache/EleutherAI/gpt-neox-20b",add_prefix_space=True,
+            cache_dir=CACHE_DIR,
+            local_files_only=local_files_only
+        )
+    neox20b_encodings = neox20b_tokenizer(text,return_tensors="pt")
+    # print(type(encodings.input_ids))
+    neo_token_ids = list(neo_encodings.input_ids)[0].tolist()
+    neo_tokens = [args.tokenizer.convert_ids_to_tokens(token_id) for token_id in neo_token_ids]
+    print("Neo model token length: {}".format(len(neo_tokens)))
+
+    neox20b_token_ids = list(neox20b_encodings.input_ids)[0].tolist()
+    neox20b_tokens = [neox20b_tokenizer.convert_ids_to_tokens(token_id) for token_id in neox20b_token_ids]
+    print("Neox20B model token length: {}".format(len(neox20b_tokens)))
+    
+    neo_mask, neox20b_mask = lcs(neo_tokens, neox20b_tokens)
+    print(len(neo_mask))
+    print(len(neox20b_mask))
+
+    # TODO save the aligned mask list 
+    masked_neo_tokens_ids = [neo_token_ids[i] for i in neo_mask]
+    masked_neox20b_tokens_ids = [neox20b_token_ids[i] for i in neox20b_mask]
+
+    neo_max_length = args.model.config.max_position_embeddings
+    context_length = args.context_length
+
+    print("PRINT neo model name: {}".format(model_name))
+    print("PRINT neo_max_length: {}".format(neo_max_length))
+    print("PRINT context_length: {}".format(context_length))
+    
+    # seq_len = encodings.input_ids.size(1)
+
+    # Neo
+    neo_seq_len = len(masked_neo_tokens_ids)
+    neox20b_seq_len = len(masked_neox20b_tokens_ids)
+    print('neo_seq_len: {}'.format(neo_seq_len))
+    print('neox20b_seq_len: {}'.format(neox20b_seq_len))
+
+    
+
+    def perplexity_calculation(model, token_id, seq_len, neox20b_flag, strd):
+        nlls = []
+        prev_end_loc = 0
+        print('PRINT stride: {}'.format(strd))
+        for begin_loc in tqdm(range(0, seq_len, strd)):
+            
+            end_loc = min(begin_loc + context_length, seq_len)
+            trg_len = end_loc - prev_end_loc  # may be different from stride on last loop
+
+            input_ids = token_id[begin_loc:end_loc].to(device)
+            print('input_ids: {}'.format(input_ids))
+            # target_ids = input_ids.clone()
+            target_ids = input_ids.copy()
+            # print('Print TEST here:')
+            # print(trg_len)
+            # print(target_ids[:-trg_len])
+            # exit()
+            target_ids[:-trg_len] = [-100]* len(target_ids[:-trg_len]) 
+
+            if neox20b_flag:   
+                input_ids = torch.tensor(input_ids).cuda('cuda:3')
+                target_ids = torch.tensor(target_ids).cuda('cuda:3')
+                # print('NEOX20B_flag is 1')
+                # print(input_ids.is_cuda)
+                # print(target_ids.is_cuda)
+            else:
+                input_ids = torch.tensor(input_ids).cuda()
+                target_ids = torch.tensor(target_ids).cuda()
+
+            with torch.no_grad():
+                input_ids = input_ids.view(1, -1)
+                target_ids = target_ids.view(1, -1)
+                outputs = model(input_ids, labels=target_ids)
+                neg_log_likelihood = outputs.loss * trg_len
+
+            nlls.append(neg_log_likelihood)
+
+            prev_end_loc = end_loc
+            if end_loc == seq_len:
+                break
+
+        ppl = torch.exp(torch.stack(nlls).sum() / end_loc) 
+        return ppl
+    
+    stride = 5
+    print('PRINT stride: {}'.format(stride))
+    neo_ppl = perplexity_calculation(args.model,masked_neo_tokens_ids, neo_seq_len,0, stride)
+    print("neo model perplexity: {}".format(neo_ppl))
+    neox20b_ppl = perplexity_calculation(neox20b_model,masked_neox20b_tokens_ids, neox20b_seq_len,1,stride)
+    print("neo20b model perplexity: {}".format(neox20b_ppl))
+    
+    
 
 @main_timer
 def main():
     args = parse_arguments()
     select_tokenizer_and_model(args)
+    print('DONE select_tokenizer_and_model.')
     setup_environ(args)
-
+    print('Done setup_environ.')
     utterance_df = load_pickle(args)
+    print('Done load_pickle.')
     utterance_df = select_conversation(args, utterance_df)
-
+    print('Done select_conversation.')
     if len(utterance_df) == 0:
         print("Conversation data does not exist")
         return
@@ -767,11 +1138,14 @@ def main():
     if args.embedding_type == "glove50":
         generate_func = generate_glove_embeddings
     elif args.embedding_type in tfsemb_dwnld.CAUSAL_MODELS:
+        print('Running for CAUSAL_MODELS')
         generate_func = generate_causal_embeddings
     elif args.embedding_type in tfsemb_dwnld.SEQ2SEQ_MODELS:
         generate_func = generate_conversational_embeddings
     else:
+        print('running for Others')
         generate_func = generate_embeddings
+        
 
     output = generate_func(args, utterance_df)
     if len(output) == 2:
@@ -779,12 +1153,16 @@ def main():
     else:
         df = output
 
+    print('Done before save_pickle.')
     save_pickle(args, df, args.output_file, embeddings)
-
+    print('Done main.')
     return
 
 
 if __name__ == "__main__":
     # NOTE: Before running this script please refer to the cache-models target
     # in the Makefile
-    main()
+    # main()
+    generate_perplexity()
+    # generate_entropy()
+    # load_model_state_dict()

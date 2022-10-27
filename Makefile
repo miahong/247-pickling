@@ -47,7 +47,7 @@ endif
 # {echo | python}
 %-pickle: PRJCT_ID := podcast
 # {tfs | podcast}
-%-pickle: SID_LIST = 676
+%-pickle: SID_LIST = 661
 # {625 676 | 661 662 717 723 741 742 743 763 798 | 777}
 
 create-pickle:
@@ -95,15 +95,15 @@ download-247-pickles:
 %-embeddings: SID := 661
 # {625 | 676 | 661} 
 %-embeddings: CONV_IDS = $(shell seq 1 1) 
-# {54 for 625 | 78 for 676 | 1 for 661}
+# {54 for 625 | 78 for 676 | 1 for 661} 
 %-embeddings: PKL_IDENTIFIER := full
 # {full | trimmed | binned}
-%-embeddings: EMB_TYPE := EleutherAI/gpt-neox-20b
+%-embeddings: EMB_TYPE := EleutherAI/gpt-neo-125M
 # {'gpt2','gpt2-medium', 'gpt2-xl', 'gpt2-large','distilgpt2', 'EleutherAI/gpt-neo-2.7B', \
-'EleutherAI/gpt-neo-1.3B','EleutherAI/gpt-neox-20b', "facebook/opt-125m", "facebook/opt-350m", \
+'EleutherAI/gpt-neo-1.3B','EleutherAI/gpt-neox-20b', "EleutherAI/gpt-neo-125M", "facebook/opt-125m", "facebook/opt-350m", \
 "facebook/opt-1.3b", "facebook/opt-2.7b", "facebook/opt-6.7b", \
-"facebook/opt-30b", "facebook/blenderbot_small-90M","bigscience/bloom-350m"}
-%-embeddings: CNXT_LEN := 1024
+"facebook/opt-30b", "facebook/blenderbot_small-90M","bigscience/bloom-560m","bigscience/bloom-7b1"}
+%-embeddings: CNXT_LEN := 2048
 %-embeddings: HIST := --history
 %-embeddings: LAYER := all
 # {'all' for all layers | 'last' for the last layer | (list of) integer(s) >= 1}
@@ -158,3 +158,15 @@ cache-models: MODEL := causal
 # {causal | seq2seq | or any model name specified in EMB_TYPE comments}
 cache-models:
 	python -c "from scripts import tfsemb_download; tfsemb_download.download_tokenizers_and_models(\"$(MODEL)\")"
+
+
+generate-perplexity-embeddings:
+	$(CMD)  scripts/tfsemb_main.py \
+				--project-id $(PRJCT_ID) \
+				--pkl-identifier $(PKL_IDENTIFIER) \
+				--subject $(SID) \
+				--conversation-id 1 \
+				--embedding-type $(EMB_TYPE) \
+				$(HIST) \
+				--layer-idx $(LAYER) \
+				--context-length $(CNXT_LEN);
